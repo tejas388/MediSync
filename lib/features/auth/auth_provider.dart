@@ -1,0 +1,253 @@
+// lib/features/auth/auth_provider.dart
+// MediSync - Auth provider: Firebase Auth + FastAPI/PostgreSQL profile sync
+// All users register and operate as caregivers.
+
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../../core/constants/app_constants.dart';
+import '../../core/errors/app_exceptions.dart';
+import '../../core/services/api_service.dart';
+import '../../models/user_profile_model.dart';
+
+class AuthProvider extends ChangeNotifier {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final GoogleSignIn _google = GoogleSignIn();
+
+  User? _firebaseUser;
+  UserProfileModel? _userProfile;
+  bool _ready = false;
+  bool _biometricEnabled = false;
+  bool _isLoadingProfile = false;
+  bool _syncInProgress = false; // prevents concurrent _syncProfile calls
+  String? _syncError;
+  final Completer<void> _readyCompleter = Completer<void>();
+
+  User? get firebaseUser => _firebaseUser;
+  UserProfileModel? get userProfile => _userProfile;
+  bool get isAuthenticated => _firebaseUser != null;
+  bool get isReady => _ready;
+  bool get isBiometricEnabled => _biometricEnabled;
+  bool get isLoadingProfile => _isLoadingProfile;
+  String? get syncError => _syncError;
+
+  // ─── Initialize (called once at app start) ─────────────────────────────────
+  Future<void> initialize() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _biometricEnabled =
+          prefs.getBool(AppConstants.prefBiometricEnabled) ?? false;
+
+      _auth.authStateChanges().listen((user) async {
+        _firebaseUser = user;
+        if (user != null) {
+          // Wait until the profile sync finishes so the role is known before routing.
+          await _syncProfile();
+        } else {
+          _userProfile = null;
+        }
+        if (!_ready) {
+          _ready = true;
+          _readyCompleter.complete();
+        }
+        notifyListeners();
+      });
+    } catch (e) {
+      debugPrint('[AuthProvider] init error: $e');
+      _ready = true;
+      _readyCompleter.complete();
+    }
+  }
+
+  /// Awaitable: resolves when the first auth state is known.
+  Future<void> waitForReady() => _readyCompleter.future;
+
+  // ─── Sign in with Email ────────────────────────────────────────────────────
+  Future<void> signInWithEmail({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      await _auth.signInWithEmailAndPassword(
+          email: email.trim(), password: password);
+    } on FirebaseAuthException catch (e) {
+      throw AuthException.fromFirebase(e.code, e.message);
+    }
+  }
+
+  // ─── Register with Email ───────────────────────────────────────────────────
+  Future<void> registerWithEmail({
+    required String name,
+    required String email,
+    required String password,
+    String role = AppConstants.roleCaregiver, // always caregiver
+  }) async {
+    try {
+      final credential = await _auth.createUserWithEmailAndPassword(
+          email: email.trim(), password: password);
+      await credential.user?.updateDisplayName(name);
+      // Sync to backend — always registers as caregiver
+      await _syncProfile(role: AppConstants.roleCaregiver, displayName: name);
+    } on FirebaseAuthException catch (e) {
+      throw AuthException.fromFirebase(e.code, e.message);
+    }
+  }
+
+  // ─── Google Sign-In ────────────────────────────────────────────────────────
+  Future<void> signInWithGoogle() async {
+    try {
+      final googleUser = await _google.signIn();
+      if (googleUser == null) {
+        throw const AuthException('Google Sign-In cancelled.',
+            code: 'google-sign-in-cancelled');
+      }
+      final gAuth = await googleUser.authentication;
+      final credential = GoogleAuthProvider.credential(
+          accessToken: gAuth.accessToken, idToken: gAuth.idToken);
+      final uc = await _auth.signInWithCredential(credential);
+
+      // Only set role on first sign-in — always caregiver
+      final isNew = uc.additionalUserInfo?.isNewUser ?? false;
+      if (isNew) await _syncProfile(role: AppConstants.roleCaregiver);
+    } on FirebaseAuthException catch (e) {
+      throw AuthException.fromFirebase(e.code, e.message);
+    }
+  }
+
+  // ─── Send password reset ───────────────────────────────────────────────────
+  Future<void> sendPasswordResetEmail(String email) async {
+    try {
+      await _auth.sendPasswordResetEmail(email: email.trim());
+    } on FirebaseAuthException catch (e) {
+      throw AuthException.fromFirebase(e.code, e.message);
+    }
+  }
+
+  // ─── Sign out ──────────────────────────────────────────────────────────────
+  Future<void> signOut() async {
+    await _google.signOut().catchError((_) => null);
+    await _auth.signOut();
+    _userProfile = null;
+    notifyListeners();
+  }
+
+  // ─── Sync profile with backend ─────────────────────────────────────────────
+  Future<void> _syncProfile({String? role, String? displayName}) async {
+    if (_syncInProgress && role == null) {
+      while (_syncInProgress) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+      return;
+    }
+    _syncInProgress = true;
+    _isLoadingProfile = true;
+    _syncError = null;
+    notifyListeners();
+    try {
+      final user = _auth.currentUser;
+      if (user == null) return;
+
+      final res = await ApiService.instance.post('/auth/sync', body: {
+        if (role != null) 'role': role,
+        if (displayName != null) 'name': displayName,
+      });
+      _userProfile =
+          UserProfileModel.fromJson(res['data'] as Map<String, dynamic>);
+      _syncError = null;
+    } catch (e) {
+      debugPrint(
+          '[AuthProvider] _syncProfile POST error: $e — falling back to GET /auth/me');
+      try {
+        final res = await ApiService.instance.get('/auth/me');
+        _userProfile =
+            UserProfileModel.fromJson(res['data'] as Map<String, dynamic>);
+        _syncError = null;
+      } catch (e2) {
+        debugPrint('[AuthProvider] _syncProfile GET /me error: $e2');
+        final firebaseUser = _auth.currentUser;
+        if (firebaseUser != null && _userProfile == null) {
+          final name = firebaseUser.displayName ??
+              firebaseUser.email?.split('@').first ??
+              'User';
+          _userProfile = UserProfileModel(
+            id: firebaseUser.uid,
+            firebaseUid: firebaseUser.uid,
+            name: name,
+            email: firebaseUser.email ?? '',
+            role: AppConstants.roleCaregiver, // always caregiver
+            photoUrl: firebaseUser.photoURL,
+            createdAt: firebaseUser.metadata.creationTime ?? DateTime.now(),
+          );
+          _syncError =
+              'Some settings unavailable — connect to sync your full profile.';
+        } else {
+          _syncError =
+              'Unable to load profile. Please check your connection and try again.';
+        }
+      }
+    } finally {
+      _syncInProgress = false;
+      _isLoadingProfile = false;
+      notifyListeners();
+    }
+  }
+
+  /// Refreshes user profile from the backend.
+  Future<void> refreshProfile() => _syncProfile();
+
+  // ─── Update profile fields ────────────────────────────────────────────────
+  Future<void> updateProfile(Map<String, dynamic> data) async {
+    try {
+      final res = await ApiService.instance.put('/auth/profile', body: data);
+      _userProfile =
+          UserProfileModel.fromJson(res['data'] as Map<String, dynamic>);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[AuthProvider] updateProfile error: $e');
+      rethrow;
+    }
+  }
+
+  // ─── Delete account ───────────────────────────────────────────────────
+  Future<void> deleteAccount() async {
+    try {
+      await ApiService.instance.delete('/auth/account');
+      await _auth.currentUser?.delete();
+      await _google.signOut().catchError((_) => null);
+      _userProfile = null;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[AuthProvider] deleteAccount error: $e');
+      rethrow;
+    }
+  }
+
+  // ─── Biometric toggle ──────────────────────────────────────────────────────
+  Future<void> toggleBiometric(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(AppConstants.prefBiometricEnabled, enabled);
+    _biometricEnabled = enabled;
+    notifyListeners();
+  }
+
+  // ─── FCM token registration ────────────────────────────────────────────────
+  Future<void> updateFcmToken(String token) async {
+    try {
+      await ApiService.instance
+          .post('/notifications/token', body: {'fcmToken': token});
+    } catch (e) {
+      debugPrint('[AuthProvider] FCM token update error: $e');
+    }
+  }
+
+  // ─── Get Firebase ID token for API calls ──────────────────────────────────
+  Future<String?> getIdToken() async {
+    try {
+      return await _auth.currentUser?.getIdToken();
+    } catch (_) {
+      return null;
+    }
+  }
+}

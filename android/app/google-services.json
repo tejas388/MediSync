@@ -1,0 +1,68 @@
+{
+  "project_info": {
+    "project_number": "855650668529",
+    "project_id": "medisync-38574",
+    "storage_bucket": "medisync-38574.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:855650668529:android:2c6615aa63248110823e50",
+        "android_client_info": {
+          "package_name": "com.example.medisync"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "855650668529-beg2jop0m7cgjbpq6q7ani3on94k46db.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDHEPR6QOM0hbPuNzNzYF0yX6kyPqZ9kNg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "855650668529-beg2jop0m7cgjbpq6q7ani3on94k46db.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:855650668529:android:a0f3cc48c6e71cb0823e50",
+        "android_client_info": {
+          "package_name": "com.medisync.medisync"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "855650668529-beg2jop0m7cgjbpq6q7ani3on94k46db.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDHEPR6QOM0hbPuNzNzYF0yX6kyPqZ9kNg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "855650668529-beg2jop0m7cgjbpq6q7ani3on94k46db.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

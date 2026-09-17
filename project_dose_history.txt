@@ -1,0 +1,1168 @@
+========== DOSES BACKEND ==========
+# backend/routers/doses.py — psycopg3 (%s placeholders)
+from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+from db.database import get_pool
+from middleware.auth import get_current_user
+from config.firebase import send_fcm_multicast
+
+router = APIRouter(prefix='/api/v1/doses', tags=['doses'])
+
+
+def row_to_dose(row) -> dict:
+    if not row:
+        return None
+    r = dict(row)
+    return {
+        'id':                   str(r['id']),
+        'userId':               str(r['user_id']),
+        'medicineId':           str(r['medicine_id']),
+        'medicineName':         r['medicine_name'],
+        'dosage':               r['dosage'],
+        'scheduledTime':        r['scheduled_time'].isoformat() if r['scheduled_time'] else None,
+        'takenTime':            r['taken_time'].isoformat()     if r['taken_time']     else None,
+        'status':               r['status'],
+        'dispensedByDevice':    r['dispensed_by_device'],
+        'dispenserCompartment': r['dispenser_compartment'],
+        'snoozedCount':         r['snoozed_count'],
+        'notes':                r['notes'],
+        'createdAt':            r['created_at'].isoformat() if r.get('created_at') else None,
+    }
+
+
+class CreateDoseBody(BaseModel):
+    medicineId:           str
+    medicineName:         str
+    dosage:               str
+    scheduledTime:        datetime
+    status:               str           = 'pending'
+    dispenserCompartment: Optional[int] = None
+
+
+class MarkTakenBody(BaseModel):
+    takenTime: Optional[datetime] = None
+
+
+class SnoozeBody(BaseModel):
+    minutes: int = 10
+
+
+@router.get('/')
+async def get_doses(
+    status:     Optional[str] = Query(None),
+    from_date:  Optional[str] = Query(None, alias='from'),
+    to_date:    Optional[str] = Query(None, alias='to'),
+    medicineId: Optional[str] = Query(None),
+    page:       int           = Query(1),
+    limit:      int           = Query(20),
+    user: dict = Depends(get_current_user),
+):
+    pool   = get_pool()
+    conds  = ['user_id = %s']
+    values = [user['id']]
+    if status:     conds.append('status = %s');           values.append(status)
+    if medicineId: conds.append('medicine_id = %s');      values.append(medicineId)
+    if from_date:  conds.append('scheduled_time >= %s');  values.append(datetime.fromisoformat(from_date))
+    if to_date:    conds.append('scheduled_time <= %s');  values.append(datetime.fromisoformat(to_date))
+
+    where  = ' AND '.join(conds)
+    offset = (page - 1) * limit
+    total  = await pool.fetchval(f'SELECT COUNT(*) FROM dose_records WHERE {where}', *values)
+    rows   = await pool.fetch(
+        f'SELECT * FROM dose_records WHERE {where} ORDER BY scheduled_time DESC LIMIT %s OFFSET %s',
+        *values, limit, offset,
+    )
+    return {
+        'success': True,
+        'data':    [row_to_dose(r) for r in rows],
+        'pagination': {'total': total, 'page': page, 'limit': limit, 'pages': -(-total // limit)},
+    }
+
+
+@router.get('/today')
+async def get_today_doses(user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    rows = await pool.fetch(
+        """SELECT * FROM dose_records
+           WHERE user_id = %s
+             AND scheduled_time >= date_trunc('day', NOW())
+             AND scheduled_time <  date_trunc('day', NOW()) + INTERVAL '1 day'
+           ORDER BY scheduled_time ASC""",
+        user['id'],
+    )
+    return {'success': True, 'data': [row_to_dose(r) for r in rows]}
+
+@router.get('/history')
+async def get_dose_history(
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    status: Optional[str] = Query(None),
+    user: dict = Depends(get_current_user),
+):
+    pool = get_pool()
+
+    conds = ['user_id = %s']
+    values = [user['id']]
+
+    if status:
+        conds.append('status = %s')
+        values.append(status)
+
+    where = ' AND '.join(conds)
+
+    offset = (page - 1) * limit
+
+    total = await pool.fetchval(
+        f'SELECT COUNT(*) FROM dose_records WHERE {where}',
+        *values,
+    )
+
+    rows = await pool.fetch(
+        f"""
+        SELECT *
+        FROM dose_records
+        WHERE {where}
+        ORDER BY scheduled_time DESC
+        LIMIT %s OFFSET %s
+        """,
+        *values,
+        limit,
+        offset,
+    )
+
+    return {
+        'success': True,
+        'data': [row_to_dose(r) for r in rows],
+        'pagination': {
+            'total': total,
+            'page': page,
+            'limit': limit,
+            'pages': -(-total // limit) if total else 0,
+        },
+    }
+
+
+@router.post('/', status_code=201)
+async def create_dose(body: CreateDoseBody, user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    row  = await pool.fetchrow(
+        """INSERT INTO dose_records
+             (user_id, medicine_id, medicine_name, dosage,
+              scheduled_time, status, dispenser_compartment)
+           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+        user['id'], body.medicineId, body.medicineName, body.dosage,
+        body.scheduledTime, body.status, body.dispenserCompartment,
+    )
+    return {'success': True, 'data': row_to_dose(row)}
+
+
+@router.patch('/{dose_id}/take')
+async def mark_taken(dose_id: str, body: MarkTakenBody, user: dict = Depends(get_current_user)):
+    pool     = get_pool()
+    taken_at = body.takenTime or datetime.utcnow()
+    row      = await pool.fetchrow(
+        "UPDATE dose_records SET status = 'taken', taken_time = %s WHERE id = %s AND user_id = %s RETURNING *",
+        taken_at, dose_id, user['id'],
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail='Dose not found')
+    await pool.execute(
+        'UPDATE medicines SET quantity = GREATEST(quantity - 1, 0) WHERE id = %s', str(row['medicine_id'])
+    )
+    return {'success': True, 'data': row_to_dose(row)}
+
+
+@router.patch('/{dose_id}/snooze')
+async def snooze_dose(dose_id: str, body: SnoozeBody, user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    row  = await pool.fetchrow(
+        """UPDATE dose_records
+           SET status = 'snoozed',
+               snoozed_count  = snoozed_count + 1,
+               scheduled_time = scheduled_time + (%s * INTERVAL '1 minute')
+           WHERE id = %s AND user_id = %s RETURNING *""",
+        body.minutes, dose_id, user['id'],
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail='Dose not found')
+    dose = row_to_dose(row)
+    return {'success': True, 'data': dose, 'nextReminder': dose['scheduledTime']}
+
+
+@router.patch('/{dose_id}/miss')
+async def mark_missed(dose_id: str, user: dict = Depends(get_current_user)):
+    pool = get_pool()
+    row  = await pool.fetchrow(
+        "UPDATE dose_records SET status = 'missed' WHERE id = %s AND user_id = %s RETURNING *",
+        dose_id, user['id'],
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail='Dose not found')
+    dose       = row_to_dose(row)
+    caregivers = await pool.fetch(
+        """SELECT u.fcm_token FROM caregiver_patient_links cpl
+           JOIN users u ON u.id = cpl.caregiver_id
+           WHERE cpl.patient_id = %s AND u.fcm_token IS NOT NULL""",
+        user['id'],
+    )
+    tokens = [c['fcm_token'] for c in caregivers]
+    if tokens:
+        t = datetime.fromisoformat(dose['scheduledTime']).strftime('%I:%M %p')
+        await send_fcm_multicast(
+            tokens, '⚠️ Missed Dose Alert',
+            f"{user['name']} missed their {dose['medicineName']} dose at {t}",
+            {'patientId': user['id'], 'doseId': dose['id']},
+        )
+    return {'success': True, 'data': dose}
+
+========== DOSE SCHEMA ==========
+93-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+94-);
+95-
+96-CREATE INDEX IF NOT EXISTS idx_medicines_user_id          ON medicines (user_id);
+97-CREATE INDEX IF NOT EXISTS idx_medicines_user_active      ON medicines (user_id, is_active);
+98-CREATE INDEX IF NOT EXISTS idx_medicines_user_compartment ON medicines (user_id, compartment_number);
+99-
+100--- ─── DOSE RECORDS ─────────────────────────────────────────────────────────────
+101--- Each row = one scheduled dose for a patient.
+102--- user_id = patient UUID (doses are tracked per patient, not per caregiver).
+103:CREATE TABLE IF NOT EXISTS dose_records (
+104-  id                    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+105-  user_id               UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+106-  medicine_id           UUID NOT NULL REFERENCES medicines (id) ON DELETE CASCADE,
+107-  medicine_name         TEXT NOT NULL,
+108-  dosage                TEXT NOT NULL,
+109-  scheduled_time        TIMESTAMPTZ NOT NULL,
+110-  taken_time            TIMESTAMPTZ,
+111-  status                TEXT NOT NULL DEFAULT 'pending'
+112-                          CHECK (status IN ('pending','taken','missed','snoozed')),
+113-  dispensed_by_device   BOOLEAN NOT NULL DEFAULT FALSE,
+114-  dispenser_compartment INTEGER,
+115-  snoozed_count         INTEGER NOT NULL DEFAULT 0,
+116-  notes                 TEXT,
+117-  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+118-  updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+119-);
+120-
+121:CREATE INDEX IF NOT EXISTS idx_dose_user_id        ON dose_records (user_id);
+122:CREATE INDEX IF NOT EXISTS idx_dose_scheduled_time ON dose_records (scheduled_time);
+123:CREATE INDEX IF NOT EXISTS idx_dose_status         ON dose_records (status);
+124:CREATE INDEX IF NOT EXISTS idx_dose_user_scheduled ON dose_records (user_id, scheduled_time DESC);
+125:CREATE INDEX IF NOT EXISTS idx_dose_user_status    ON dose_records (user_id, status);
+126:CREATE INDEX IF NOT EXISTS idx_dose_medicine_sched ON dose_records (medicine_id, scheduled_time DESC);
+127-
+128--- ─── DISPENSERS ───────────────────────────────────────────────────────────────
+129--- An ESP32 smart dispenser linked to a patient's account.
+130--- user_id = patient UUID (the dispenser serves one patient).
+131-CREATE TABLE IF NOT EXISTS dispensers (
+132-  id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+133-  device_id            TEXT NOT NULL UNIQUE,
+134-  user_id              UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+135-  is_online            BOOLEAN NOT NULL DEFAULT FALSE,
+136-  battery_level        INTEGER NOT NULL DEFAULT 0 CHECK (battery_level BETWEEN 0 AND 100),
+137-  wifi_signal_strength INTEGER NOT NULL DEFAULT -100,
+138-  firmware_version     TEXT    NOT NULL DEFAULT '1.0.0',
+139-  total_dispenses      INTEGER NOT NULL DEFAULT 0,
+140-  is_emergency_mode    BOOLEAN NOT NULL DEFAULT FALSE,
+141-  last_seen            TIMESTAMPTZ,
+142-  -- JSONB array: [{"number":1,"stock":10,"medicine_id":"uuid-or-null"}, ...]
+143-  compartments         JSONB   NOT NULL DEFAULT '[]',
+144-  -- JSONB object or null: {"compartment_number":1,"triggered_at":"...","triggered_by":"...","is_acknowledged":false}
+145-  pending_dispense     JSONB,
+146-  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+147-  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+148-);
+149-
+150-CREATE INDEX IF NOT EXISTS idx_dispensers_device_id ON dispensers (device_id);
+151-CREATE INDEX IF NOT EXISTS idx_dispensers_user_id   ON dispensers (user_id);
+152-
+153--- ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+154--- Notifications sent to caregivers about their patients.
+155--- user_id = caregiver UUID (the one who receives the alert).
+156-CREATE TABLE IF NOT EXISTS notifications (
+157-  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+158-  user_id       UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+159-  title         TEXT NOT NULL,
+160-  body          TEXT NOT NULL,
+161-  type          TEXT NOT NULL CHECK (type IN (
+162-                  'doseReminder','doseMissed','lowStock','expiryAlert',
+163-                  'caregiverAlert','deviceOffline','emergencySOS','scheduleUpdate'
+164-                )),
+165-  is_read       BOOLEAN NOT NULL DEFAULT FALSE,
+166-  medicine_id   UUID REFERENCES medicines (id) ON DELETE SET NULL,
+167-  medicine_name TEXT,
+168-  extra         JSONB,
+169-  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+170-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+171-);
+--
+180-BEGIN
+181-  NEW.updated_at = NOW();
+182-  RETURN NEW;
+183-END;
+184-$$ LANGUAGE plpgsql;
+185-
+186-DO $$
+187-DECLARE
+188-  t TEXT;
+189-BEGIN
+190:  FOREACH t IN ARRAY ARRAY['users','medicines','dose_records','dispensers','notifications']
+191-  LOOP
+192-    EXECUTE format(
+193-      'DROP TRIGGER IF EXISTS trg_%s_updated_at ON %s;
+194-       CREATE TRIGGER trg_%s_updated_at
+195-         BEFORE UPDATE ON %s
+196-         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();',
+197-      t, t, t, t
+198-    );
+199-  END LOOP;
+200-END;
+201-$$;
+
+========== NOTIFICATION SERVICE ==========
+// lib/core/services/notification_service.dart
+// MediSync - Local notification service (flutter_local_notifications)
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest_all.dart' as tz_data;
+import '../constants/app_constants.dart';
+
+class NotificationService {
+  NotificationService._();
+  static final NotificationService instance = NotificationService._();
+
+  final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  bool _initialized = false;
+
+  // ─── Initialise ────────────────────────────────────────────────────────────
+  Future<void> init() async {
+    if (_initialized) return;
+
+    tz_data.initializeTimeZones();
+    // Set local timezone — change to your locale if needed
+    try {
+      tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
+    } catch (_) {
+      tz.setLocalLocation(tz.UTC);
+    }
+
+    const androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosSettings = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+
+    await _plugin.initialize(
+      const InitializationSettings(
+          android: androidSettings, iOS: iosSettings),
+      onDidReceiveNotificationResponse: _onTap,
+      onDidReceiveBackgroundNotificationResponse: _onTapBackground,
+    );
+
+    // Create Android notification channel
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(const AndroidNotificationChannel(
+      AppConstants.notifChannelId,
+      AppConstants.notifChannelName,
+      description: AppConstants.notifChannelDesc,
+      importance: Importance.max,
+      playSound: true,
+      enableVibration: true,
+      enableLights: true,
+    ));
+
+    _initialized = true;
+    debugPrint('[NotificationService] Initialised');
+  }
+
+  // ─── Notification Details ──────────────────────────────────────────────────
+  NotificationDetails get _defaultDetails => const NotificationDetails(
+        android: AndroidNotificationDetails(
+          AppConstants.notifChannelId,
+          AppConstants.notifChannelName,
+          channelDescription: AppConstants.notifChannelDesc,
+          importance: Importance.max,
+          priority: Priority.high,
+          enableLights: true,
+          enableVibration: true,
+          playSound: true,
+          icon: '@mipmap/ic_launcher',
+        ),
+        iOS: DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
+
+  // ─── Show instant notification ─────────────────────────────────────────────
+  Future<void> showInstant({
+    required int id,
+    required String title,
+    required String body,
+    String? payload,
+  }) async {
+    if (!_initialized) await init();
+    await _plugin.show(id, title, body, _defaultDetails, payload: payload);
+  }
+
+  // ─── Schedule a medicine reminder ──────────────────────────────────────────
+  Future<void> scheduleMedicineReminder({
+    required int id,
+    required String medicineName,
+    required String dosage,
+    required DateTime scheduledTime,
+    String? payload,
+  }) async {
+    if (!_initialized) await init();
+    if (scheduledTime.isBefore(DateTime.now())) return;
+
+    final tzTime = tz.TZDateTime.from(scheduledTime, tz.local);
+
+    await _plugin.zonedSchedule(
+      id,
+      '💊 Time for $medicineName',
+      'Take your $dosage dose now',
+      tzTime,
+      _defaultDetails,
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+      payload: payload,
+    );
+    debugPrint('[NotificationService] Scheduled: $medicineName at $scheduledTime');
+  }
+
+  // ─── Cancel medicine reminders ─────────────────────────────────────────────
+  Future<void> cancelMedicineReminders(String medicineId) async {
+    final baseId = medicineId.hashCode.abs() % 10000;
+    for (int i = 0; i < AppConstants.maxReminderTimesPerMedicine; i++) {
+      await _plugin.cancel(baseId + i);
+    }
+    debugPrint('[NotificationService] Cancelled reminders for $medicineId');
+  }
+
+  // ─── Cancel single notification ────────────────────────────────────────────
+  Future<void> cancel(int id) => _plugin.cancel(id);
+
+  // ─── Cancel all ────────────────────────────────────────────────────────────
+  Future<void> cancelAll() => _plugin.cancelAll();
+
+  // ─── Low stock alert ──────────────────────────────────────────────────────
+  Future<void> showLowStockAlert({
+    required String medicineName,
+    required int quantity,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('lowstock_$medicineName').hashCode.abs() % 90000 + 10000;
+    await _plugin.show(
+      id,
+      '📦 Low Stock Alert',
+      '$medicineName has only $quantity tablet${quantity == 1 ? '' : 's'} left. Please refill soon.',
+      _defaultDetails,
+      payload: 'lowStock',
+    );
+  }
+
+  // ─── Expiry alert ─────────────────────────────────────────────────────────
+  Future<void> showExpiryAlert({
+    required String medicineName,
+    required int daysLeft,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('expiry_$medicineName').hashCode.abs() % 90000 + 20000;
+    await _plugin.show(
+      id,
+      '📅 Expiry Alert',
+      '$medicineName expires in $daysLeft day${daysLeft == 1 ? '' : 's'}. Please renew your prescription.',
+      _defaultDetails,
+      payload: 'expiryAlert',
+    );
+  }
+
+  // ─── Missed dose alert ─────────────────────────────────────────────────────
+  Future<void> showMissedDoseAlert({
+    required String medicineName,
+    required String scheduledTime,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('missed_$medicineName').hashCode.abs() % 90000 + 30000;
+    await _plugin.show(
+      id,
+      '⚠️ Missed Dose',
+      'You missed your $medicineName dose scheduled at $scheduledTime.',
+      _defaultDetails,
+      payload: 'doseMissed',
+    );
+  }
+
+  // ─── Get pending notifications ─────────────────────────────────────────────
+  Future<List<PendingNotificationRequest>> getPending() =>
+      _plugin.pendingNotificationRequests();
+
+  // ─── Tap handler ──────────────────────────────────────────────────────────
+  static void _onTap(NotificationResponse response) {
+    debugPrint('[NotificationService] Tapped: ${response.payload}');
+    // Navigation is handled by the app's main navigator
+  }
+
+  @pragma('vm:entry-point')
+  static void _onTapBackground(NotificationResponse response) {
+    debugPrint('[NotificationService] Background tap: ${response.payload}');
+  }
+}
+
+========== HISTORY SCREEN ==========
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'package:medisync/core/constants/app_colors.dart';
+import 'package:medisync/core/services/api_service.dart';
+import 'package:medisync/models/dose_record_model.dart';
+
+class HistoryScreen extends StatefulWidget {
+  final String? patientId; // optional: show history for a specific patient
+  const HistoryScreen({super.key, this.patientId});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  final ScrollController _scrollController = ScrollController();
+  
+  List<DoseRecordModel> _records = [];
+  bool _isLoading = true;
+  bool _isLoadingMore = false;
+  int _page = 1;
+  String _selectedStatus = 'all';
+  DateTime? _fromDate;
+  DateTime? _toDate;
+  bool _hasMore = true;
+
+  final List<String> _statusFilters = ['all', 'taken', 'missed', 'snoozed'];
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchHistory();
+    _scrollController.addListener(_onScroll);
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (_scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200 &&
+        !_isLoadingMore &&
+        _hasMore) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _fetchHistory({bool refresh = false}) async {
+    if (refresh) {
+      setState(() {
+        _page = 1;
+        _hasMore = true;
+      });
+    } else if (_page == 1) {
+      setState(() {
+        _isLoading = true;
+      });
+    }
+
+    try {
+      final fromStr = _fromDate != null ? DateFormat('yyyy-MM-dd').format(_fromDate!) : null;
+      final toStr = _toDate != null ? DateFormat('yyyy-MM-dd').format(_toDate!) : null;
+      
+      final data = await DoseApi.getHistory(
+        status: _selectedStatus == 'all' ? null : _selectedStatus,
+        from: fromStr,
+        to: toStr,
+        page: _page,
+      );
+
+      final List<DoseRecordModel> newRecords = data.map((e) => DoseRecordModel.fromJson(e)).toList();
+
+      setState(() {
+        if (_page == 1) {
+          _records = newRecords;
+        } else {
+          _records.addAll(newRecords);
+        }
+        _hasMore = newRecords.length == 25; // Assuming limit is 25
+        _isLoading = false;
+        _isLoadingMore = false;
+      });
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+        _isLoadingMore = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to load history: $e'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() {
+      _isLoadingMore = true;
+      _page++;
+    });
+    await _fetchHistory();
+  }
+
+  Future<void> _selectDateRange() async {
+    final initialDateRange = DateTimeRange(
+      start: _fromDate ?? DateTime.now().subtract(const Duration(days: 7)),
+      end: _toDate ?? DateTime.now(),
+    );
+
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+      initialDateRange: initialDateRange,
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: ColorScheme.light(
+              primary: AppColors.primary,
+              onPrimary: Colors.white,
+              onSurface: Theme.of(context).brightness == Brightness.dark ? Colors.white : Colors.black,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (picked != null) {
+      setState(() {
+        _fromDate = picked.start;
+        _toDate = picked.end;
+      });
+      _fetchHistory(refresh: true);
+    }
+  }
+
+  void _clearDateFilter() {
+    setState(() {
+      _fromDate = null;
+      _toDate = null;
+    });
+    _fetchHistory(refresh: true);
+  }
+
+  String _formatDateHeader(DateTime date) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final yesterday = today.subtract(const Duration(days: 1));
+    final dateToCheck = DateTime(date.year, date.month, date.day);
+
+    if (dateToCheck == today) {
+      return 'Today';
+    } else if (dateToCheck == yesterday) {
+      return 'Yesterday';
+    } else {
+      return DateFormat('MMM d, yyyy').format(dateToCheck);
+    }
+  }
+
+  Color _getStatusColor(String status) {
+    switch (status) {
+      case 'taken':
+        return AppColors.success;
+      case 'missed':
+        return AppColors.error;
+      case 'snoozed':
+        return AppColors.warning;
+      case 'pending':
+      default:
+        return AppColors.textSecondaryLight;
+    }
+  }
+
+  Map<String, List<DoseRecordModel>> _groupRecordsByDate() {
+    final Map<String, List<DoseRecordModel>> grouped = {};
+    for (var record in _records) {
+      final dateStr = DateFormat('yyyy-MM-dd').format(record.scheduledTime);
+      if (!grouped.containsKey(dateStr)) {
+        grouped[dateStr] = [];
+      }
+      grouped[dateStr]!.add(record);
+    }
+    return grouped;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    
+    return Scaffold(
+      backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFFF9FAFB),
+      appBar: AppBar(
+        title: const Text(
+          'History',
+          style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.w700),
+        ),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        flexibleSpace: Container(
+          decoration: const BoxDecoration(
+            gradient: AppColors.primaryGradient,
+          ),
+        ),
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.date_range),
+            onPressed: _selectDateRange,
+            tooltip: 'Filter by date range',
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          _buildFilters(isDark),
+          Expanded(
+            child: _isLoading 
+                ? _buildShimmer(isDark)
+                : RefreshIndicator(
+                    onRefresh: () => _fetchHistory(refresh: true),
+                    color: AppColors.primary,
+                    child: _records.isEmpty
+                        ? _buildEmptyState(isDark)
+                        : _buildHistoryList(isDark),
+                  ),
+          ),
+          if (_isLoadingMore)
+            Container(
+              padding: const EdgeInsets.all(16.0),
+              alignment: Alignment.center,
+              child: const CircularProgressIndicator(color: AppColors.primary),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilters(bool isDark) {
+    return Container(
+      color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+      padding: const EdgeInsets.symmetric(vertical: 12.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: Row(
+              children: _statusFilters.map((status) {
+                final isSelected = _selectedStatus == status;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8.0),
+                  child: FilterChip(
+                    label: Text(
+                      status[0].toUpperCase() + status.substring(1),
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
+                        color: isSelected 
+                            ? Colors.white 
+                            : (isDark ? Colors.white70 : Colors.black87),
+                      ),
+                    ),
+                    selected: isSelected,
+                    onSelected: (bool selected) {
+                      setState(() {
+                        _selectedStatus = status;
+                      });
+                      _fetchHistory(refresh: true);
+                    },
+                    backgroundColor: isDark ? const Color(0xFF2C2C2C) : Colors.grey[200],
+                    selectedColor: AppColors.primary,
+                    checkmarkColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20),
+                      side: BorderSide(
+                        color: isSelected ? AppColors.primary : Colors.transparent,
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          if (_fromDate != null && _toDate != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 16.0, right: 16.0, top: 12.0),
+              child: Row(
+                children: [
+                  const Icon(Icons.event_available, size: 16, color: AppColors.primary),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${DateFormat('MMM d').format(_fromDate!)} - ${DateFormat('MMM d').format(_toDate!)}',
+                    style: TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 13,
+                      color: isDark ? Colors.white70 : Colors.black87,
+                    ),
+                  ),
+                  const Spacer(),
+                  InkWell(
+                    onTap: _clearDateFilter,
+                    child: const Text(
+                      'Clear',
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                        color: AppColors.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryList(bool isDark) {
+    final groupedData = _groupRecordsByDate();
+    final dates = groupedData.keys.toList()
+      ..sort((a, b) => b.compareTo(a)); // Sort descending
+
+    return ListView.builder(
+      controller: _scrollController,
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.all(16.0),
+      itemCount: dates.length,
+      itemBuilder: (context, index) {
+        final dateStr = dates[index];
+        final recordsForDate = groupedData[dateStr]!;
+        final headerDate = DateTime.parse(dateStr);
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 8.0, bottom: 12.0, left: 4.0),
+              child: Text(
+                _formatDateHeader(headerDate),
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: isDark ? Colors.white : Colors.black87,
+                ),
+              ),
+            ),
+            ...recordsForDate.map((record) => _buildDoseCard(record, isDark)),
+            const SizedBox(height: 16),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildDoseCard(DoseRecordModel record, bool isDark) {
+    final statusColor = _getStatusColor(record.status);
+    final cardColor = isDark ? const Color(0xFF1E1E1E) : Colors.white;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12.0),
+      decoration: BoxDecoration(
+        color: cardColor,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: isDark ? [] : AppColors.cardShadow,
+        border: Border.all(
+          color: isDark ? const Color(0xFF333333) : AppColors.borderLight,
+          width: 1,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: statusColor.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(
+                record.isTaken ? Icons.check_circle_outline :
+                record.isMissed ? Icons.cancel_outlined :
+                record.isSnoozed ? Icons.snooze : Icons.access_time,
+                color: statusColor,
+                size: 24,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+
+========== API SERVICE ==========
+// lib/core/services/api_service.dart
+// MediSync - HTTP client backed by FastAPI/PostgreSQL REST API
+// Authorization: Firebase ID token injected automatically.
+
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'package:firebase_auth/firebase_auth.dart';
+
+
+class ApiService {
+  ApiService._();
+  static final ApiService instance = ApiService._();
+
+  // ── Change to your machine's local IP when running on a physical device ──
+  static String get _baseUrl => kIsWeb ? 'http://localhost:5001/api/v1' : 'http://172.29.89.242:5001/api/v1';
+  static const Duration _timeout = Duration(seconds: 20);
+
+  // ─── Auth header ────────────────────────────────────────────────────────────
+  Future<Map<String, String>> _headers() async {
+    // forceRefresh=false uses the cached token (refreshes automatically when
+    // expired). Do NOT print the token — it is a security-sensitive credential.
+    final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+    return {
+      'Content-Type': 'application/json',
+      if (token != null) 'Authorization': 'Bearer $token',
+    };
+  }
+
+  // ─── GET ────────────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> get(
+    String path, {
+    Map<String, String>? params,
+  }) async {
+    final uri = _uri(path, params);
+    debugPrint('[API] GET $uri');
+    final res = await http
+        .get(uri, headers: await _headers())
+        .timeout(_timeout);
+    return _parse(res);
+  }
+
+  // ─── GET bytes (PDF) ────────────────────────────────────────────────────────
+  Future<Uint8List> getBytes(
+    String path, {
+    Map<String, String>? params,
+  }) async {
+    final uri = _uri(path, params);
+    debugPrint('[API] GET bytes $uri');
+    final res = await http
+        .get(uri, headers: await _headers())
+        .timeout(_timeout);
+    if (res.statusCode >= 400) {
+      throw _error(res);
+    }
+    return res.bodyBytes;
+  }
+
+  // ─── POST ───────────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> post(
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    final uri = _uri(path);
+    debugPrint('[API] POST $uri');
+    final res = await http
+        .post(uri, headers: await _headers(), body: jsonEncode(body ?? {}))
+        .timeout(_timeout);
+    return _parse(res);
+  }
+
+  // ─── PUT ────────────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> put(
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    final uri = _uri(path);
+    debugPrint('[API] PUT $uri');
+    final res = await http
+        .put(uri, headers: await _headers(), body: jsonEncode(body ?? {}))
+        .timeout(_timeout);
+    return _parse(res);
+  }
+
+  // ─── PATCH ──────────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> patch(
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    final uri = _uri(path);
+    debugPrint('[API] PATCH $uri');
+    final res = await http
+        .patch(uri, headers: await _headers(), body: jsonEncode(body ?? {}))
+        .timeout(_timeout);
+    return _parse(res);
+  }
+
+  // ─── DELETE ─────────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> delete(String path) async {
+    final uri = _uri(path);
+    debugPrint('[API] DELETE $uri');
+    final res = await http
+        .delete(uri, headers: await _headers())
+        .timeout(_timeout);
+    return _parse(res);
+  }
+
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
+  Uri _uri(String path, [Map<String, String>? params]) {
+    final base  = Uri.parse('$_baseUrl$path');
+    return params != null ? base.replace(queryParameters: params) : base;
+  }
+
+  Map<String, dynamic> _parse(http.Response res) {
+    debugPrint('[API] ${res.statusCode} ${res.request?.url}');
+    if (res.statusCode >= 400) throw _error(res);
+    if (res.body.isEmpty) return {'success': true};
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  Exception _error(http.Response res) {
+    try {
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      return Exception(body['message'] ?? 'Server error ${res.statusCode}');
+    } catch (_) {
+      return Exception('Server error ${res.statusCode}');
+    }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TYPED API FACADES
+// ═════════════════════════════════════════════════════════════════════════════
+
+final _api = ApiService.instance;
+
+// ── Medicines ─────────────────────────────────────────────────────────────────
+class MedicineApi {
+  static Future<List<Map<String, dynamic>>> getAll(
+      {Map<String, String>? params}) async {
+    final res = await _api.get('/medicines', params: params);
+    return List<Map<String, dynamic>>.from(res['data'] as List? ?? []);
+  }
+
+  static Future<Map<String, dynamic>> getById(String id) async {
+    final res = await _api.get('/medicines/$id');
+    return res['data'] as Map<String, dynamic>;
+  }
+
+  static Future<Map<String, dynamic>> create(
+      Map<String, dynamic> data) async {
+    final res = await _api.post('/medicines', body: data);
+    return res['data'] as Map<String, dynamic>;
+  }
+
+  static Future<Map<String, dynamic>> update(
+      String id, Map<String, dynamic> data) async {
+    final res = await _api.put('/medicines/$id', body: data);
+    return res['data'] as Map<String, dynamic>;
+  }
+
+  static Future<void> delete(String id) =>
+      _api.delete('/medicines/$id');
+  static Future<Map<int, String>> getSharedCompartments() async {
+    final res = await _api.get('/medicines/shared-compartments');
+    final data = res['data'] as Map<String, dynamic>? ?? {};
+    return data.map((key, value) => MapEntry(int.parse(key), value as String));
+  }
+}
+
+// ── Doses ─────────────────────────────────────────────────────────────────────
+class DoseApi {
+  static Future<List<dynamic>> getToday() async {
+    final res = await _api.get('/doses/today');
+    return res['data'] as List? ?? [];
+  }
+
+  static Future<List<dynamic>> getHistory({
+    String? status,
+    String? from,
+    String? to,
+    int page = 1,
+    int limit = 25,
+  }) async {
+    final params = <String, String>{
+      'page':  page.toString(),
+      'limit': limit.toString(),
+      if (status != null) 'status': status,
+      if (from != null)   'from':   from,
+      if (to   != null)   'to':     to,
+    };
+    final res = await _api.get('/doses/history', params: params);
+    return res['data'] as List? ?? [];
+  }
+
+  static Future<void> markTaken(String id) =>
+      _api.patch('/doses/$id/take');
+
+  static Future<void> snooze(String id, {int minutes = 10}) =>
+      _api.patch('/doses/$id/snooze', body: {'minutes': minutes});
+}
+
+// ── Analytics ─────────────────────────────────────────────────────────────────
+class AnalyticsApi {
+  static Future<Map<String, dynamic>> getSummary() async {
+    final res = await _api.get('/analytics/summary');
+    return res['data'] as Map<String, dynamic>? ?? {};
+  }
+
+  static Future<Map<String, dynamic>> getAdherence({int days = 7}) async {
+    final res = await _api.get('/analytics/adherence',
+        params: {'days': days.toString()});
+    return res['data'] as Map<String, dynamic>? ?? {};
+  }
+
+  static Future<List<dynamic>> getPerMedicine() async {
+    final res = await _api.get('/analytics/per-medicine');
+    return res['data'] as List? ?? [];
+  }
+
+  static Future<Map<String, dynamic>> getStreak() async {
+    final res = await _api.get('/analytics/streak');
+    return res['data'] as Map<String, dynamic>? ?? {};
+  }
+}
+
+// ── Dispenser ─────────────────────────────────────────────────────────────────
+class DispenserApi {
+  static Future<Map<String, dynamic>> getStatus() async {
+    final res = await _api.get('/dispenser/status');
+    return res['data'] as Map<String, dynamic>;
+  }
+
+  static Future<void> manualDispense(int compartment) =>
+      _api.post('/dispenser/dispense', body: {'compartmentNumber': compartment});
+
+  static Future<void> emergencyDispense(int compartment) =>
+      _api.post('/dispenser/emergency', body: {'compartmentNumber': compartment});
+
+  static Future<void> registerDevice(String deviceId) =>

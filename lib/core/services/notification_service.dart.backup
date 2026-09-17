@@ -1,0 +1,200 @@
+// lib/core/services/notification_service.dart
+// MediSync - Local notification service (flutter_local_notifications)
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:timezone/data/latest_all.dart' as tz_data;
+import '../constants/app_constants.dart';
+
+class NotificationService {
+  NotificationService._();
+  static final NotificationService instance = NotificationService._();
+
+  final FlutterLocalNotificationsPlugin _plugin =
+      FlutterLocalNotificationsPlugin();
+
+  bool _initialized = false;
+
+  // ─── Initialise ────────────────────────────────────────────────────────────
+  Future<void> init() async {
+    if (_initialized) return;
+
+    tz_data.initializeTimeZones();
+    // Set local timezone — change to your locale if needed
+    try {
+      tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
+    } catch (_) {
+      tz.setLocalLocation(tz.UTC);
+    }
+
+    const androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosSettings = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+
+    await _plugin.initialize(
+      const InitializationSettings(
+          android: androidSettings, iOS: iosSettings),
+      onDidReceiveNotificationResponse: _onTap,
+      onDidReceiveBackgroundNotificationResponse: _onTapBackground,
+    );
+
+    // Create Android notification channel
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(const AndroidNotificationChannel(
+      AppConstants.notifChannelId,
+      AppConstants.notifChannelName,
+      description: AppConstants.notifChannelDesc,
+      importance: Importance.max,
+      playSound: true,
+      enableVibration: true,
+      enableLights: true,
+    ));
+
+    _initialized = true;
+    debugPrint('[NotificationService] Initialised');
+  }
+
+  // ─── Notification Details ──────────────────────────────────────────────────
+  NotificationDetails get _defaultDetails => const NotificationDetails(
+        android: AndroidNotificationDetails(
+          AppConstants.notifChannelId,
+          AppConstants.notifChannelName,
+          channelDescription: AppConstants.notifChannelDesc,
+          importance: Importance.max,
+          priority: Priority.high,
+          enableLights: true,
+          enableVibration: true,
+          playSound: true,
+          icon: '@mipmap/ic_launcher',
+        ),
+        iOS: DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
+
+  // ─── Show instant notification ─────────────────────────────────────────────
+  Future<void> showInstant({
+    required int id,
+    required String title,
+    required String body,
+    String? payload,
+  }) async {
+    if (!_initialized) await init();
+    await _plugin.show(id, title, body, _defaultDetails, payload: payload);
+  }
+
+  // ─── Schedule a medicine reminder ──────────────────────────────────────────
+  Future<void> scheduleMedicineReminder({
+    required int id,
+    required String medicineName,
+    required String dosage,
+    required DateTime scheduledTime,
+    String? payload,
+  }) async {
+    if (!_initialized) await init();
+    if (scheduledTime.isBefore(DateTime.now())) return;
+
+    final tzTime = tz.TZDateTime.from(scheduledTime, tz.local);
+
+    await _plugin.zonedSchedule(
+      id,
+      '💊 Time for $medicineName',
+      'Take your $dosage dose now',
+      tzTime,
+      _defaultDetails,
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+      payload: payload,
+    );
+    debugPrint('[NotificationService] Scheduled: $medicineName at $scheduledTime');
+  }
+
+  // ─── Cancel medicine reminders ─────────────────────────────────────────────
+  Future<void> cancelMedicineReminders(String medicineId) async {
+    final baseId = medicineId.hashCode.abs() % 10000;
+    for (int i = 0; i < AppConstants.maxReminderTimesPerMedicine; i++) {
+      await _plugin.cancel(baseId + i);
+    }
+    debugPrint('[NotificationService] Cancelled reminders for $medicineId');
+  }
+
+  // ─── Cancel single notification ────────────────────────────────────────────
+  Future<void> cancel(int id) => _plugin.cancel(id);
+
+  // ─── Cancel all ────────────────────────────────────────────────────────────
+  Future<void> cancelAll() => _plugin.cancelAll();
+
+  // ─── Low stock alert ──────────────────────────────────────────────────────
+  Future<void> showLowStockAlert({
+    required String medicineName,
+    required int quantity,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('lowstock_$medicineName').hashCode.abs() % 90000 + 10000;
+    await _plugin.show(
+      id,
+      '📦 Low Stock Alert',
+      '$medicineName has only $quantity tablet${quantity == 1 ? '' : 's'} left. Please refill soon.',
+      _defaultDetails,
+      payload: 'lowStock',
+    );
+  }
+
+  // ─── Expiry alert ─────────────────────────────────────────────────────────
+  Future<void> showExpiryAlert({
+    required String medicineName,
+    required int daysLeft,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('expiry_$medicineName').hashCode.abs() % 90000 + 20000;
+    await _plugin.show(
+      id,
+      '📅 Expiry Alert',
+      '$medicineName expires in $daysLeft day${daysLeft == 1 ? '' : 's'}. Please renew your prescription.',
+      _defaultDetails,
+      payload: 'expiryAlert',
+    );
+  }
+
+  // ─── Missed dose alert ─────────────────────────────────────────────────────
+  Future<void> showMissedDoseAlert({
+    required String medicineName,
+    required String scheduledTime,
+  }) async {
+    if (!_initialized) await init();
+    final id = ('missed_$medicineName').hashCode.abs() % 90000 + 30000;
+    await _plugin.show(
+      id,
+      '⚠️ Missed Dose',
+      'You missed your $medicineName dose scheduled at $scheduledTime.',
+      _defaultDetails,
+      payload: 'doseMissed',
+    );
+  }
+
+  // ─── Get pending notifications ─────────────────────────────────────────────
+  Future<List<PendingNotificationRequest>> getPending() =>
+      _plugin.pendingNotificationRequests();
+
+  // ─── Tap handler ──────────────────────────────────────────────────────────
+  static void _onTap(NotificationResponse response) {
+    debugPrint('[NotificationService] Tapped: ${response.payload}');
+    // Navigation is handled by the app's main navigator
+  }
+
+  @pragma('vm:entry-point')
+  static void _onTapBackground(NotificationResponse response) {
+    debugPrint('[NotificationService] Background tap: ${response.payload}');
+  }
+}
